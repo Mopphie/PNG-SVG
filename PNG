@@ -255,21 +255,37 @@ def _ensure_black_fill_and_stroke(svg_content: str) -> str:
 
     def replace_attrs(match):
         element_name = match.group(1)
-        attributes = match.group(2) # Aktuelle Attribute als String
+        attributes = match.group(2)  # Aktuelle Attribute als String
 
-        # Ersetze oder füge 'fill="#000000"' hinzu
-        if re.search(r'fill\s*=\s*["\']?[^"\']*["\']?', attributes, re.IGNORECASE):
-            attributes = re.sub(r'fill\s*=\s*["\']?[^"\']*["\']?', 'fill="#000000"', attributes, flags=re.IGNORECASE)
+        style_match = re.search(r'style\s*=\s*"([^"]*)"', attributes, re.IGNORECASE)
+        style = ""
+        if style_match:
+            style = style_match.group(1)
+            attributes = attributes[:style_match.start()] + attributes[style_match.end():]
+
+            # Passe vorhandene fill/stroke Angaben im style-Attribut an
+            if re.search(r'fill\s*:[^;"\']*', style, re.IGNORECASE):
+                style = re.sub(r'fill\s*:[^;"\']*', 'fill:#000000', style, flags=re.IGNORECASE)
+            else:
+                style += ';fill:#000000'
+
+            if re.search(r'stroke\s*:[^;"\']*', style, re.IGNORECASE):
+                style = re.sub(r'stroke\s*:[^;"\']*', 'stroke:none', style, flags=re.IGNORECASE)
+            else:
+                style += ';stroke:none'
         else:
-            attributes += ' fill="#000000"'
+            style = 'fill:#000000;stroke:none'
 
-        # Entferne oder setze 'stroke="none"', da Ausmalbilder oft keine sichtbaren Striche haben
-        if re.search(r'stroke\s*=\s*["\']?[^"\']*["\']?', attributes, re.IGNORECASE):
-            attributes = re.sub(r'stroke\s*=\s*["\']?[^"\']*["\']?', 'stroke="none"', attributes, flags=re.IGNORECASE)
-        else:
-            attributes += ' stroke="none"'
+        # Entferne explizite fill= oder stroke= Attribute außerhalb des style-Attributs
+        attributes = re.sub(r'fill\s*=\s*"[^"]*"', '', attributes, flags=re.IGNORECASE)
+        attributes = re.sub(r'stroke\s*=\s*"[^"]*"', '', attributes, flags=re.IGNORECASE)
 
-        return f'<{element_name} {attributes.strip()}>' # .strip() entfernt ggf. überschüssige Leerzeichen
+        attrs = attributes.strip()
+        if attrs:
+            attrs += ' '
+        attrs += f'style="{style}"'
+
+        return f'<{element_name} {attrs}>'  # .strip() entfernt ggf. überschüssige Leerzeichen
 
     return pattern.sub(replace_attrs, svg_content)
 
