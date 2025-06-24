@@ -191,25 +191,26 @@ def smart_retry(max_retry: int = 4):
 @smart_retry()
 def analyze_image(png_path: Path) -> Tuple[str, List[str]]:
     """Analysiert das gegebene PNG-Ausmalbild und liefert Motiv und Tags auf Deutsch mit Gemini."""
-    img = Image.open(png_path)
-    prompt = (
-        "Analysiere das gezeigte Ausmalbild. Antworte **nur** mit\n"
-        "MOTIV: <kurze Phrase>\nTAGS: <comma sep tags>"
-    )
-    resp = MODEL_IMAGE.generate_content([prompt, img])
-    
-    # Robustere Extraktion mit Fallback-Werten
-    text_content = resp.text.strip()
-    motif_match = re.search(r"MOTIV:(.*)", text_content, re.I)
-    tags_match = re.search(r"TAGS:(.*)", text_content, re.I)
-    
-    motif = motif_match.group(1).strip() if motif_match else "Unbekanntes Motiv"
-    tags = [t.strip() for t in tags_match.group(1).split(',') if t.strip()] if tags_match else []
+    # FIX: Bilddatei mit Context Manager öffnen, um sicherzustellen, dass sie geschlossen wird
+    with Image.open(png_path) as img:
+        prompt = (
+            "Analysiere das gezeigte Ausmalbild. Antworte **nur** mit\n"
+            "MOTIV: <kurze Phrase>\nTAGS: <comma sep tags>"
+        )
+        resp = MODEL_IMAGE.generate_content([prompt, img])
+        
+        # Robustere Extraktion mit Fallback-Werten
+        text_content = resp.text.strip()
+        motif_match = re.search(r"MOTIV:(.*)", text_content, re.I)
+        tags_match = re.search(r"TAGS:(.*)", text_content, re.I)
+        
+        motif = motif_match.group(1).strip() if motif_match else "Unbekanntes Motiv"
+        tags = [t.strip() for t in tags_match.group(1).split(',') if t.strip()] if tags_match else []
 
-    if not motif or not tags:
-        log.warning("Gemini Analyse für %s unvollständig: Motiv='%s', Tags='%s'. Ganze Antwort: %s", png_path.name, motif, tags, text_content)
+        if not motif or not tags:
+            log.warning("Gemini Analyse für %s unvollständig: Motiv='%s', Tags='%s'. Ganze Antwort: %s", png_path.name, motif, tags, text_content)
 
-    return motif, tags
+        return motif, tags
 
 @smart_retry()
 def translate(text: str, lang_name: str, lang_code: str):
@@ -242,7 +243,7 @@ check_inkscape()
 
 def _ensure_black_fill_and_stroke(svg_content: str) -> str:
     """
-    NEUE HILFSFUNKTION: Stellt sicher, dass SVG-Pfade und Formen eine schwarze Füllung haben
+    Stellt sicher, dass SVG-Pfade und Formen eine schwarze Füllung haben
     und unerwünschte Striche entfernt werden.
     """
     # Regex, um gängige SVG-Form-Elemente zu finden (pfad, rect, circle, etc.)
@@ -276,8 +277,8 @@ def _ensure_black_fill_and_stroke(svg_content: str) -> str:
 def trace_png_to_svg(png_path: Path, svg_out: Path):
     """
     Vektorisiert ein PNG zu einem SVG mittels Inkscapes Trace Bitmap Funktion.
-    NEU: Verwendet expliziten FileImport und EditSelectAll für Robustheit.
-    NEU: Erzwingt Tracing-Parameter direkt im Befehl, um manuelle Einstellungen zu umgehen.
+    Verwendet expliziten FileImport und EditSelectAll für Robustheit.
+    Erzwingt Tracing-Parameter direkt im Befehl, um manuelle Einstellungen zu umgehen.
     """
     log.info("Vektorisierung von %s...", png_path.name)
     # --actions:
