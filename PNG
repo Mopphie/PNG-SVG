@@ -292,16 +292,18 @@ def _ensure_black_fill_and_stroke(svg_content: str) -> str:
 
 def trace_png_to_svg(png_path: Path, svg_out: Path):
     """
-    Vektorisiert ein PNG zu einem SVG mittels Inkscapes Trace Bitmap Funktion.
-    Verwendet expliziten FileImport und EditSelectAll für Robustheit.
-    Erzwingt Tracing-Parameter direkt im Befehl, um manuelle Einstellungen zu umgehen.
+    Vektorisiert ein PNG zu einem SVG.  Inkscape ≥1.3 nutzt "SelectionTrace"
+    über ``--actions``.  Die ehemals verfügbaren ``--trace-bitmap*`` Flags sind
+    veraltet und wurden entfernt, sodass die aktuell gespeicherten
+    Vektorisierungseinstellungen greifen.
     """
     log.info("Vektorisierung von %s...", png_path.name)
     # --actions:
     # FileNew: Erstellt ein neues leeres Dokument.
     # FileImport:{png_path}: Importiert das PNG in das neue Dokument.
     # EditSelectAll: Wählt alle Objekte im Dokument aus (jetzt das importierte PNG).
-    # SelectionTrace: Führt die Vektorisierung aus (verwendet die unten explizit genannten Parameter).
+    # SelectionTrace: Führt die Vektorisierung aus (verwendet die in Inkscape
+    # gespeicherten Parameter).
     # ObjectToPath: Wandelt das Ergebnis in Pfade um (statt eingebettetem Bild).
     # SelectionUnGroup: Entgruppiert ggf. entstandene Gruppen.
     # FileSave;FileClose: Speichert und schließt das Dokument.
@@ -310,14 +312,7 @@ def trace_png_to_svg(png_path: Path, svg_out: Path):
            f"--actions=FileNew;FileImport:{png_path};EditSelectAll;SelectionTrace;ObjectToPath;SelectionUnGroup;FileSave;FileClose",
            f"--export-type=svg",
            f"--export-filename={svg_out}",
-           "--export-plain-svg", # Exportiert ein "plain" SVG, oft kleiner und sauberer
-           # NEUER FIX: Direkte Übergabe der Tracing-Parameter, um manuelle Einstellungen zu umgehen
-           "--trace-bitmap", # Aktiviert den Trace Bitmap Modus
-           "--trace-bitmap-mode=brightness", # Modus: Helligkeitsschwellwert
-           "--trace-bitmap-threshold=0.65", # Schwellenwert: 0.65 (ein guter Startwert für Linienzeichnungen)
-           # "--trace-bitmap-invert", # Optional: Nur wenn die Linien weiß auf Schwarz sind und invertiert werden müssen
-           # "--trace-bitmap-smooth=0.1", # Optional: Glättung (kann Details verlieren, oft nicht für Ausmalbilder)
-           # "--trace-bitmap-optimize=0.1", # Optional: Optimierung (reduziert Pfadpunkte)
+           "--export-plain-svg",  # Exportiert ein "plain" SVG, oft kleiner und sauberer
            ]
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
