@@ -249,13 +249,14 @@ def _ensure_black_fill_and_stroke(svg_content: str) -> str:
     # Regex, um gängige SVG-Form-Elemente zu finden (pfad, rect, circle, etc.)
     # und deren Attribute zu erfassen.
     pattern = re.compile(
-        r'<(path|rect|circle|ellipse|polygon|polyline|line)\s*([^>]*?)>',
+        r"<(path|rect|circle|ellipse|polygon|polyline|line)\b([^<>]*?)(/?)>",
         re.IGNORECASE | re.DOTALL
     )
 
     def replace_attrs(match):
         element_name = match.group(1)
         attributes = match.group(2)  # Aktuelle Attribute als String
+        closing = match.group(3)
 
         style_match = re.search(r'style\s*=\s*"([^"]*)"', attributes, re.IGNORECASE)
         style = ""
@@ -284,8 +285,7 @@ def _ensure_black_fill_and_stroke(svg_content: str) -> str:
         if attrs:
             attrs += ' '
         attrs += f'style="{style}"'
-
-        return f'<{element_name} {attrs}>'  # .strip() entfernt ggf. überschüssige Leerzeichen
+        return f'<{element_name} {attrs}{closing}>'  # .strip() entfernt ggf. überschüssige Leerzeichen
 
     return pattern.sub(replace_attrs, svg_content)
 
