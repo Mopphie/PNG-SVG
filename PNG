@@ -1,0 +1,593 @@
+# -*- coding: utf-8 -*-
+"""
+Printable Content-Pipeline
+--------------------------
+• Wandelt PNG-Ausmalbilder in **echte SVG-Vektoren** (Trace Bitmap mit Inkscape)
+• Erzeugt A4-SVGs mit Rand (Verhältnis 210:297)
+• Erzeugt A4-Thumbnails (Breite fest, Höhe A4-Verhältnis)
+• Analysiert Motive & Tags mit **Gemini Flash 1.5**
+• Übersetzt Titel + Tags in 20 Sprachen (Cache in SQLite)
+• Lädt SVG & Thumbnail nach Firebase Storage und legt Metadaten in Firestore ab
+
+‼ VORAUSSETZUNGEN
+    🖼️ Inkscape ≥ 1.3    (muss im System-PATH sein oder INKSCAPE_PATH in .env setzen)
+                         (Manuelle Anpassung der Inkscape Trace Bitmap Standardeinstellungen ist jetzt OPTIONAL, da Skript Parameter setzt)
+    🔑 Umgebungsvariablen (oder .env) →  GEMINI_API_KEY, FIREBASE_CREDENTIALS, FIREBASE_BUCKET
+    🐍 pip install -r requirements.txt
+        (Liste der benötigten Pakete für requirements.txt:
+        google-generativeai
+        firebase-admin
+        pillow
+        python-dotenv
+        typer
+        urllib3
+        )
+"""
+
+from __future__ import annotations
+import os, re, json, time, uuid, hashlib, tempfile, logging, threading, subprocess
+import datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Tuple, Dict, List
+import http.client # Für TimeoutException und SocketException
+import socket # Für SocketException
+import urllib3.exceptions # Für ProtocolError (falls urllib3 verwendet wird)
+
+from dotenv import load_dotenv # Benötigt: pip install python-dotenv
+from PIL import Image # Benötigt: pip install pillow
+import google.generativeai as genai # Benötigt: pip install google-generativeai
+from google.api_core import exceptions as google_api_exceptions # WICHTIG: Für API-Fehlerbehandlung
+import firebase_admin # Benötigt: pip install firebase-admin
+from firebase_admin import credentials, firestore, storage
+import sqlite3 # Standardbibliothek, keine Installation nötig
+
+# ───────────────────────── CONFIG ──────────────────────────
+load_dotenv()
+GEMINI_API_KEY        = os.environ["GEMINI_API_KEY"]
+# FIREBASE_CREDENTIALS muss der PFAD zur heruntergeladenen JSON-Service-Account-Datei sein!
+FIREBASE_CREDENTIALS  = os.environ["FIREBASE_CREDENTIALS"] 
+FIREBASE_BUCKET       = os.environ["FIREBASE_BUCKET"] # Muss "projekt-id.appspot.com" sein
+INKSCAPE_PATH         = os.getenv("INKSCAPE_PATH", "inkscape") # Standardmäßig "inkscape", sucht im PATH
+DEFAULT_DPI           = 96 # Standard-DPI für Inkscape-Berechnungen
+MAX_PARALLEL          = int(os.getenv("MAX_PARALLEL", "1")) # WICHTIG: Auf 1 gesetzt, um Gemini Quota-Limits zu vermeiden
+TARGET_THUMB_WIDTH_PX = int(os.getenv("THUMB_WIDTH", "350")) # Breite des A4-Thumbnails in Pixeln
+
+# A4-Maße in Millimetern
+A4_WIDTH_MM, A4_HEIGHT_MM = 210, 297
+
+# Mapping von Sprachnamen zu ISO 639-1 Codes für Übersetzungen
+LANG_MAP: Dict[str, str] = {
+    "Deutsch": "de", "Englisch": "en", "Spanisch": "es", "Französisch": "fr",
+    "Italienisch": "it", "Portugiesisch": "pt", "Niederländisch": "nl", "Japanisch": "ja",
+    "Koreanisch": "ko", "Mandarin": "zh", "Russisch": "ru", "Arabisch": "ar", "Hindi": "hi",
+    "Türkisch": "tr", "Polnisch": "pl", "Schwedisch": "sv", "Indonesisch": "id",
+    "Vietnamesisch": "vi", "Tschechisch": "cs", "Ukrainisch": "uk"
+}
+
+# NEU: Der Hauptordner auf deinem System, der die Unterordner "Kategorie_Unterkategorie" enthält.
+# BITTE DIESEN PFAD ANPASSEN!
+BASE_IMAGE_DIRECTORY: Path = Path(r"C:\Users\Michi\Desktop\Ausmalbilder\Gemini neuer Designvorschlag\Technische Umsetzung\Bilder")
+
+# ──────────────────────── LOGGING ──────────────────────────
+# Konfiguriert das Logging, um Nachrichten in eine Datei und auf die Konsole auszugeben
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s | %(message)s",
+                    handlers=[logging.FileHandler("processing.log", encoding="utf-8"),
+                              logging.StreamHandler()])
+log = logging.getLogger(__name__)
+
+# ─────────────── FIREBASE / GEMINI INITIALISIERUNG ─────────
+# Initialisiert Firebase nur einmal, wenn die App noch nicht initialisiert wurde
+if not firebase_admin._apps:
+    try:
+        # Versucht, FIREBASE_CREDENTIALS als Dateipfad zu laden (empfohlen)
+        if os.path.isfile(FIREBASE_CREDENTIALS):
+            cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+            log.info("Firebase-Credentials als Dateipfad erkannt und geladen.")
+        else:
+            # Fallback: Versucht, FIREBASE_CREDENTIALS als JSON-String zu parsen
+            cred_dict = json.loads(FIREBASE_CREDENTIALS)
+            cred = credentials.Certificate(cred_dict)
+            log.info("Firebase-Credentials als JSON-String erkannt und geladen.")
+    except (json.JSONDecodeError, ValueError) as e:
+        log.error("FEHLER: FIREBASE_CREDENTIALS ist ungültig (weder gültiger JSON-String noch existierender Dateipfad). Details: %s", e)
+        # Beendet das Skript, da Firebase nicht initialisiert werden kann
+        raise SystemExit("Firebase-Initialisierung fehlgeschlagen. Bitte FIREBASE_CREDENTIALS in der .env-Datei überprüfen.")
+
+    # Initialisiert die Firebase Admin SDK-App
+    firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_BUCKET})
+
+# Firestore-Client und Storage-Bucket instanziieren
+_db: firestore.Client = firestore.client()
+_bucket: storage.Bucket = storage.bucket()
+
+# Gemini-Modelle konfigurieren
+genai.configure(api_key=GEMINI_API_KEY)
+MODEL_IMAGE = genai.GenerativeModel("gemini-1.5-flash") # Modell für Bildanalyse
+MODEL_TRANS = genai.GenerativeModel("gemini-1.5-flash") # Modell für Übersetzungen
+
+# ────────────────────── HILFSKLASSEN ───────────────────────
+class RateLimiter:
+    """Implementiert ein einfaches Rate-Limiting für API-Aufrufe, um Limits nicht zu überschreiten."""
+    def __init__(self, rpm: int = 60): # Standard: 60 Anfragen pro Minute
+        self.rpm = rpm
+        self._lock = threading.Lock()
+        self._times: List[dt.datetime] = []
+
+    def wait(self):
+        with self._lock:
+            now = dt.datetime.now()
+            # Entfernt Zeitstempel, die älter als 60 Sekunden sind
+            self._times = [t for t in self._times if (now - t).seconds < 60]
+            if len(self._times) >= self.rpm:
+                # Berechnet die Wartezeit, bis die älteste Anfrage aus dem Fenster fällt
+                sleep_duration = 60 - (now - self._times[0]).seconds + 1
+                log.warning("Rate-Limit erreicht – warte %.1fs", sleep_duration)
+                time.sleep(sleep_duration)
+            # Fügt den aktuellen Zeitstempel hinzu
+            self._times.append(dt.datetime.now())
+
+# Instanz des RateLimiters
+rate = RateLimiter()
+
+class TranslationCache:
+    """SQLite-basierter Cache für Übersetzungen (original_text, language) -> translated_text."""
+    def __init__(self, path: str = "translation_cache.db"):
+        # Verbindet zur SQLite-Datenbank; check_same_thread=False erlaubt Zugriff von mehreren Threads
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        # Erstellt die Cache-Tabelle, falls sie nicht existiert
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS tcache (
+                                orig TEXT, lang TEXT, trans TEXT,
+                                PRIMARY KEY(orig, lang))""")
+        self.lock = threading.Lock() # Sperre für den Multi-Thread-Zugriff
+
+    def get(self, text: str, lang: str):
+        """Holt eine Übersetzung aus dem Cache."""
+        with self.lock:
+            cur = self.conn.execute("SELECT trans FROM tcache WHERE orig=? AND lang=?", (text, lang))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def set(self, text: str, lang: str, trans: str):
+        """Speichert eine Übersetzung im Cache."""
+        with self.lock:
+            self.conn.execute("INSERT OR REPLACE INTO tcache VALUES (?,?,?)", (text, lang, trans))
+            self.conn.commit()
+
+# Instanz des Übersetzungs-Caches
+cache = TranslationCache()
+
+# ────────────────────── GEMINI CALLS ───────────────────────
+
+def smart_retry(max_retry: int = 4):
+    """Decorator für robuste API-Aufrufe mit intelligentem Retry und Fehlerbehandlung."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retry):
+                try:
+                    rate.wait() # Wartet, falls Rate-Limit erreicht ist
+                    return func(*args, **kwargs)
+                except (
+                    google_api_exceptions.ResourceExhausted, # Abfangen des Quota-Fehlers
+                    google_api_exceptions.InternalServerError, # Abfangen generischer Serverfehler
+                    google_api_exceptions.ServiceUnavailable, # Abfangen von Dienst-Nicht-Verfügbar-Fehlern
+                    http.client.RemoteDisconnected,           # Server hat Verbindung getrennt
+                    socket.timeout,                           # Socket-Timeout (z.B. bei http.client)
+                    TimeoutError,                             # Generischer Timeout-Fehler
+                    urllib3.exceptions.ProtocolError          # Fehler von urllib3 (oft bei Netzwerkproblemen)
+                ) as e:
+                    log.warning("%s fehlgeschlagen (%s). Versuch %d/%d", func.__name__, e, attempt+1, max_retry)
+                    time.sleep(2 ** attempt) # Exponentieller Backoff vor dem nächsten Versuch
+                except Exception as e:
+                    # Fängt alle anderen unerwarteten Fehler ab und loggt sie ohne Retry
+                    log.error("%s unerwarteter Fehler: %s. Kein weiterer Versuch.", func.__name__, e, exc_info=True)
+                    raise # Gibt den Fehler weiter
+            # Wenn alle Retries fehlgeschlagen sind
+            raise RuntimeError(f"{func.__name__} permanent fehlgeschlagen nach {max_retry} Versuchen.")
+        return wrapper
+    return decorator
+
+@smart_retry()
+def analyze_image(png_path: Path) -> Tuple[str, List[str]]:
+    """Analysiert das gegebene PNG-Ausmalbild und liefert Motiv und Tags auf Deutsch mit Gemini."""
+    img = Image.open(png_path)
+    prompt = (
+        "Analysiere das gezeigte Ausmalbild. Antworte **nur** mit\n"
+        "MOTIV: <kurze Phrase>\nTAGS: <comma sep tags>"
+    )
+    resp = MODEL_IMAGE.generate_content([prompt, img])
+    
+    # Robustere Extraktion mit Fallback-Werten
+    text_content = resp.text.strip()
+    motif_match = re.search(r"MOTIV:(.*)", text_content, re.I)
+    tags_match = re.search(r"TAGS:(.*)", text_content, re.I)
+    
+    motif = motif_match.group(1).strip() if motif_match else "Unbekanntes Motiv"
+    tags = [t.strip() for t in tags_match.group(1).split(',') if t.strip()] if tags_match else []
+
+    if not motif or not tags:
+        log.warning("Gemini Analyse für %s unvollständig: Motiv='%s', Tags='%s'. Ganze Antwort: %s", png_path.name, motif, tags, text_content)
+
+    return motif, tags
+
+@smart_retry()
+def translate(text: str, lang_name: str, lang_code: str):
+    """Übersetzt Text in die Zielsprache unter Nutzung des Cache und Gemini."""
+    cached = cache.get(text, lang_code)
+    if cached:
+        return cached # Übersetzung aus dem Cache zurückgeben
+    
+    prompt = f"Übersetze folgenden Text ins {lang_name}. Gib **nur** die Übersetzung zurück.\n{text}"
+    resp = MODEL_TRANS.generate_content(prompt)
+    trans = resp.text.strip()
+    cache.set(text, lang_code, trans) # Übersetzung im Cache speichern
+    return trans
+
+# ──────────────── INKSCAPE-HILFSFUNKTIONEN ────────────────
+
+def check_inkscape():
+    """Prüft beim Start des Skripts, ob Inkscape im Systempfad verfügbar ist."""
+    try:
+        subprocess.run([INKSCAPE_PATH, "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        log.error("FEHLER: Inkscape wurde nicht gefunden. Bitte installiere es oder setze den korrekten Pfad in der INKSCAPE_PATH-Umgebungsvariable (oder in .env).")
+        raise SystemExit("Inkscape nicht gefunden.")
+    except subprocess.CalledProcessError as e:
+        log.error("FEHLER: Inkscape --version gab einen Fehler zurück. Überprüfe die Inkscape-Installation. Fehlermeldung: %s", e.stderr.decode())
+        raise SystemExit(f"Inkscape --version gab Fehler zurück: {e.stderr.decode()}")
+
+# Führt die Inkscape-Prüfung einmalig beim Skriptstart aus
+check_inkscape()
+
+def _ensure_black_fill_and_stroke(svg_content: str) -> str:
+    """
+    NEUE HILFSFUNKTION: Stellt sicher, dass SVG-Pfade und Formen eine schwarze Füllung haben
+    und unerwünschte Striche entfernt werden.
+    """
+    # Regex, um gängige SVG-Form-Elemente zu finden (pfad, rect, circle, etc.)
+    # und deren Attribute zu erfassen.
+    pattern = re.compile(
+        r'<(path|rect|circle|ellipse|polygon|polyline|line)\s*([^>]*?)>',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    def replace_attrs(match):
+        element_name = match.group(1)
+        attributes = match.group(2) # Aktuelle Attribute als String
+
+        # Ersetze oder füge 'fill="#000000"' hinzu
+        if re.search(r'fill\s*=\s*["\']?[^"\']*["\']?', attributes, re.IGNORECASE):
+            attributes = re.sub(r'fill\s*=\s*["\']?[^"\']*["\']?', 'fill="#000000"', attributes, flags=re.IGNORECASE)
+        else:
+            attributes += ' fill="#000000"'
+
+        # Entferne oder setze 'stroke="none"', da Ausmalbilder oft keine sichtbaren Striche haben
+        if re.search(r'stroke\s*=\s*["\']?[^"\']*["\']?', attributes, re.IGNORECASE):
+            attributes = re.sub(r'stroke\s*=\s*["\']?[^"\']*["\']?', 'stroke="none"', attributes, flags=re.IGNORECASE)
+        else:
+            attributes += ' stroke="none"'
+
+        return f'<{element_name} {attributes.strip()}>' # .strip() entfernt ggf. überschüssige Leerzeichen
+
+    return pattern.sub(replace_attrs, svg_content)
+
+
+def trace_png_to_svg(png_path: Path, svg_out: Path):
+    """
+    Vektorisiert ein PNG zu einem SVG mittels Inkscapes Trace Bitmap Funktion.
+    NEU: Verwendet expliziten FileImport und EditSelectAll für Robustheit.
+    NEU: Erzwingt Tracing-Parameter direkt im Befehl, um manuelle Einstellungen zu umgehen.
+    """
+    log.info("Vektorisierung von %s...", png_path.name)
+    # --actions:
+    # FileNew: Erstellt ein neues leeres Dokument.
+    # FileImport:{png_path}: Importiert das PNG in das neue Dokument.
+    # EditSelectAll: Wählt alle Objekte im Dokument aus (jetzt das importierte PNG).
+    # SelectionTrace: Führt die Vektorisierung aus (verwendet die unten explizit genannten Parameter).
+    # ObjectToPath: Wandelt das Ergebnis in Pfade um (statt eingebettetem Bild).
+    # SelectionUnGroup: Entgruppiert ggf. entstandene Gruppen.
+    # FileSave;FileClose: Speichert und schließt das Dokument.
+    cmd = [INKSCAPE_PATH,
+           "--batch-process",
+           f"--actions=FileNew;FileImport:{png_path};EditSelectAll;SelectionTrace;ObjectToPath;SelectionUnGroup;FileSave;FileClose",
+           f"--export-type=svg",
+           f"--export-filename={svg_out}",
+           "--export-plain-svg", # Exportiert ein "plain" SVG, oft kleiner und sauberer
+           # NEUER FIX: Direkte Übergabe der Tracing-Parameter, um manuelle Einstellungen zu umgehen
+           "--trace-bitmap", # Aktiviert den Trace Bitmap Modus
+           "--trace-bitmap-mode=brightness", # Modus: Helligkeitsschwellwert
+           "--trace-bitmap-threshold=0.65", # Schwellenwert: 0.65 (ein guter Startwert für Linienzeichnungen)
+           # "--trace-bitmap-invert", # Optional: Nur wenn die Linien weiß auf Schwarz sind und invertiert werden müssen
+           # "--trace-bitmap-smooth=0.1", # Optional: Glättung (kann Details verlieren, oft nicht für Ausmalbilder)
+           # "--trace-bitmap-optimize=0.1", # Optional: Optimierung (reduziert Pfadpunkte)
+           ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # Überprüfen, ob die SVG-Datei tatsächlich erstellt und nicht leer ist
+        if not svg_out.exists() or svg_out.stat().st_size == 0:
+            log.error("Inkscape hat keine SVG-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
+                      svg_out, result.stdout, result.stderr)
+            raise RuntimeError(f"Inkscape hat keine SVG-Datei erstellt oder sie ist leer: {svg_out}")
+    except subprocess.CalledProcessError as e:
+        log.error("Inkscape Vektorisierung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
+                  png_path.name, e, e.stdout, e.stderr)
+        raise
+    log.info("Vektorisierung erfolgreich: %s", svg_out.name)
+
+
+def create_a4_canvas(svg_in: Path, svg_a4_out: Path):
+    """Bettet das getracte SVG in eine A4-Seite mit Rand ein, um ein sauberes Druckformat zu gewährleisten."""
+    log.info("A4-Canvas für %s erstellen...", svg_in.name)
+    dpi = DEFAULT_DPI
+    a4_w_px = int(A4_WIDTH_MM * dpi / 25.4) # A4-Breite in Pixeln
+    a4_h_px = int(A4_HEIGHT_MM * dpi / 25.4) # A4-Höhe in Pixeln
+
+    # Das SVG-Template für das A4-Blatt.
+    # Motiv max. 90 % der Seite (scale=0.9). Das lässt 5% Rand oben/unten/links/rechts.
+    scale_factor = 0.9 
+    translate_x = (a4_w_px * (1 - scale_factor)) / 2
+    translate_y = (a4_h_px * (1 - scale_factor)) / 2
+
+    # NEUER FIX: width und height im SVG-Root-Tag in Pixeln angegeben, passend zum viewBox
+    # WICHTIG: Das weiße <rect> im Template wurde entfernt, da Drucker ohnehin Papier füllen.
+    template = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg width="{a4_w_px}px" height="{a4_h_px}px" 
+     viewBox="0 0 {a4_w_px} {a4_h_px}"
+     xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <g transform="translate({int(translate_x)},{int(translate_y)}) scale({scale_factor})">
+    {{content}}
+  </g>
+</svg>"""
+    
+    # Lese den Inhalt des raw.svg
+    full_raw_svg_content = Path(svg_in).read_text(encoding="utf-8")
+    # FIX: Extrahiere nur den Inhalt zwischen dem ersten <svg...> und </svg>-Tag, um doppelte XML-Header zu vermeiden.
+    match = re.search(r"<svg[^>]*?>(.*?)</svg>", full_raw_svg_content, re.DOTALL)
+    
+    if match:
+        # Hier ist der reine SVG-Inhalt, ohne XML-Deklaration und äußeren <svg>-Tag
+        inner_svg_content = match.group(1).strip()
+    else:
+        log.error(f"FEHLER: Konnte inneren SVG-Inhalt aus {svg_in.name} nicht extrahieren. Ganze Datei wird eingefügt, was zu Fehlern führen kann.")
+        inner_svg_content = full_raw_svg_content # Fallback, sollte aber nicht passieren, wenn raw.svg gültig ist
+
+    # NEUER FIX: Erzwinge schwarze Füllung und entferne Striche im SVG-Inhalt
+    inner_svg_content = _ensure_black_fill_and_stroke(inner_svg_content)
+
+    with open(svg_a4_out, "w", encoding="utf-8") as fh:
+        # Füllt das `{{content}}`-Platzhalter im Template mit dem BEREINIGTEN SVG-Inhalt
+        fh.write(template.format(content=inner_svg_content))
+    log.info("A4-Canvas erstellt: %s", svg_a4_out.name)
+
+
+def create_thumbnail(svg_path: Path, thumb_out: Path):
+    """Rendert ein PNG-Thumbnail aus dem A4-SVG mit einer festen Breite und proportionaler Höhe."""
+    log.info("Thumbnail für %s erstellen...", svg_path.name)
+    cmd = [INKSCAPE_PATH, str(svg_path),
+           "--export-type=png",
+           f"--export-width={TARGET_THUMB_WIDTH_PX}", # Nur --export-width übergeben, Inkscape skaliert Höhe automatisch
+           # NEUER FIX: --export-area-page stellt sicher, dass die gesamte A4-Seite exportiert wird
+           "--export-area-page",
+           "--export-background=white", # Stellt sicher, dass der Hintergrund weiß ist
+           "--export-filename", str(thumb_out)] # Explizite Angabe von --export-filename für Robustheit
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if not thumb_out.exists() or thumb_out.stat().st_size == 0:
+            log.error("Inkscape hat keine Thumbnail-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
+                      thumb_out, result.stdout, result.stderr)
+            raise RuntimeError(f"Inkscape hat keine Thumbnail-Datei erstellt oder sie ist leer: {thumb_out}")
+
+        # NEU: Zusätzliche Komprimierung des PNG mit Pillow für kleinere Dateigröße
+        img = Image.open(thumb_out)
+        img.save(thumb_out, optimize=True, compress_level=9) # compress_level=9 für höchste Komprimierung
+    except subprocess.CalledProcessError as e:
+        log.error("Inkscape Thumbnail-Erstellung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
+                  svg_path.name, e, e.stdout, e.stderr)
+        raise
+    log.info("Thumbnail erfolgreich: %s", thumb_out.name)
+
+# ───────────────────────── STORAGE ─────────────────────────
+
+def upload(local: Path, blob_name: str, mime: str) -> str:
+    """Lädt eine lokale Datei zu Firebase Storage hoch und gibt den Blob-Namen zurück."""
+    log.info("Hochladen von %s zu Firebase Storage (%s)...", local.name, blob_name)
+    blob = _bucket.blob(blob_name)
+    blob.upload_from_filename(str(local), content_type=mime)
+    log.info("Hochladen erfolgreich: %s", blob_name)
+    return blob.name # Gibt den Pfad in Storage zurück
+
+# ────────────────────── HELPER FUNKTIONEN ───────────────────
+
+def sha256(path: Path) -> str:
+    """Berechnet den SHA256-Hash einer Datei, um sie eindeutig zu identifizieren."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# ───────────────────────── WORKER ───────────────────────────
+
+def process_png(png_path: Path, main_cat: str, sub_cat: str):
+    """
+    Verarbeitet eine einzelne PNG-Datei:
+    1. Prüft, ob bereits verarbeitet (via Hash in Firestore).
+    2. Analysiert Bild & übersetzt Metadaten mit Gemini.
+    3. Vektorisiert PNG zu SVG und bettet in A4-Canvas ein.
+    4. Erstellt ein PNG-Thumbnail aus dem A4-SVG.
+    5. Lädt SVG & Thumbnail nach Firebase Storage hoch.
+    6. Speichert Metadaten in Firestore.
+    7. Löscht das Original-PNG (falls erfolgreich).
+    """
+    log.info("Starte Verarbeitung von Bild: %s (Kategorie: %s/%s)", png_path.name, main_cat, sub_cat)
+    
+    file_hash = sha256(png_path)
+    
+    # Prüft, ob das Bild bereits verarbeitet wurde
+    if _db.collection("processed_files").document(file_hash).get().exists:
+        log.info("%s wurde bereits verarbeitet (Hash: %s) – übersprungen.", png_path.name, file_hash)
+        return "skipped"
+
+    try:
+        # NEU: Vorprüfung des PNGs mit Pillow, um ungültige Dateien frühzeitig zu erkennen
+        try:
+            Image.open(png_path).verify()
+        except Exception as e:
+            raise ValueError(f"Ungültige oder beschädigte PNG-Datei gefunden: {e}. Überspringe.")
+
+        # 1. Analyse & Übersetzung mit Gemini
+        log.info("Schritt 1: Starte Gemini-Analyse für %s...", png_path.name)
+        motif_de, tags_de = analyze_image(png_path)
+        log.info("Analyse abgeschlossen: Motiv='%s', Tags='%s'", motif_de, tags_de)
+        
+        log.info("Schritt 2: Übersetze Metadaten...")
+        translations = {}
+        for ln, lc in LANG_MAP.items():
+            # Übersetzt Titel und Tags in alle konfigurierten Sprachen
+            if lc == "de":
+                translations[lc] = dict(title=motif_de, tags=tags_de)
+            else:
+                translated_title = translate(motif_de, ln, lc)
+                translated_tags = [translate(t, ln, lc) for t in tags_de]
+                translations[lc] = dict(title=translated_title, tags=translated_tags)
+        log.info("Übersetzungen abgeschlossen.")
+
+        # 2. SVG-Konvertierung & Thumbnail-Erstellung mit Inkscape
+        log.info("Schritt 3: Erstelle SVG und Thumbnail mit Inkscape...")
+        # Nutzt ein temporäres Verzeichnis für Zwischenergebnisse
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            svg_raw = tmp_path / "raw.svg" # Rohes, getractes SVG
+            svg_a4 = tmp_path / "a4.svg"   # SVG in A4-Format mit Rand
+            thumb_png = tmp_path / "thumb.png" # Generiertes PNG-Thumbnail
+
+            trace_png_to_svg(png_path, svg_raw)
+            create_a4_canvas(svg_raw, svg_a4)
+            create_thumbnail(svg_a4, thumb_png) # Thumbnail aus dem A4-SVG erstellen
+
+            # Erzeugt einen URL-freundlichen "slug" für die Dateinamen in Firebase Storage
+            # Bestehend aus bereinigtem Motiv und einem kurzen UUID für Eindeutigkeit
+            slug = re.sub(r"[^a-z0-9]+", "-", motif_de.lower())
+            slug = slug[:50].strip('-') # Kürzt den Slug und entfernt führende/abschließende Bindestriche
+            if not slug: # Fallback, falls das Motiv keinen gültigen Slug ergibt
+                slug = "bild"
+            slug += "-" + uuid.uuid4().hex[:6] # Fügt eine kurze eindeutige ID hinzu
+
+            # Definieren der vollständigen Pfade in Firebase Storage
+            svg_blob_name = f"{main_cat}/{sub_cat}/{slug}.svg"
+            png_blob_name = f"{main_cat}/{sub_cat}/{slug}.png"
+
+            # 3. Upload zu Firebase Storage
+            log.info("Schritt 4: Lade Dateien zu Firebase Storage hoch...")
+            upload(svg_a4, svg_blob_name, "image/svg+xml")
+            upload(thumb_png, png_blob_name, "image/png")
+            log.info("Uploads abgeschlossen.")
+
+        # 4. Metadaten in Firestore speichern
+        log.info("Schritt 5: Speichere Metadaten in Firestore...")
+        doc_data = {
+            "title": {lc: d["title"] for lc, d in translations.items()},
+            "tags": {lc: d["tags"] for lc, d in translations.items()},
+            "mainCategory": main_cat, # Hauptkategorie aus Ordnername
+            "subCategory": sub_cat,   # Unterkategorie aus Ordnername
+            "pathSvg": svg_blob_name, # Pfad zum A4-SVG in Storage
+            "pathPng": png_blob_name, # Pfad zum Thumbnail in Storage
+            "createdAt": firestore.SERVER_TIMESTAMP, # Zeitstempel der Erstellung (Firestore-Serverzeit)
+            "hash": file_hash, # SHA256-Hash des Original-PNGs für Duplikatsprüfung
+            "isPremium": False, # Beispiel-Feld: Kann später für Premium-Inhalte genutzt werden
+        }
+        _db.collection("images").add(doc_data) # Fügt ein neues Dokument zur "images"-Collection hinzu
+        # Markiert den Hash als verarbeitet in einer separaten Collection
+        _db.collection("processed_files").document(file_hash).set({"ts": firestore.SERVER_TIMESTAMP})
+        log.info("Metadaten in Firestore gespeichert.")
+
+        # NEU: Original-PNG nach erfolgreicher Verarbeitung löschen, um den Quellordner aufgeräumt zu halten
+        png_path.unlink(missing_ok=True) 
+        log.info("Bild %s vollständig verarbeitet und hochgeladen. Original-PNG gelöscht.", png_path.name)
+        return "processed"
+
+    except Exception as e:
+        # Fängt alle Fehler ab und loggt sie detailliert
+        log.error("FEHLER bei Verarbeitung von %s (Kategorie: %s/%s): %s", png_path.name, main_cat, sub_cat, e, exc_info=True)
+        return "failed"
+
+# ─────────────────────────── MAIN ──────────────────────────
+
+def main():
+    """
+    Hauptfunktion der Pipeline:
+    Durchsucht den BASE_IMAGE_DIRECTORY nach Kategorie_Unterkategorie-Ordnern,
+    sammelt alle PNGs und startet die parallele Verarbeitung.
+    """
+    log.info("Starte Bildverarbeitung von Basis-Verzeichnis: %s", BASE_IMAGE_DIRECTORY)
+    
+    files_to_process: List[Tuple[Path, str, str]] = []
+    
+    # Prüft, ob der Basis-Ordner existiert
+    if not BASE_IMAGE_DIRECTORY.is_dir():
+        log.error("FEHLER: Basis-Ordner nicht gefunden oder ist kein Verzeichnis: %s", BASE_IMAGE_DIRECTORY)
+        return
+
+    # Iteriert über alle direkten Unterordner im Basis-Verzeichnis
+    for folder in BASE_IMAGE_DIRECTORY.iterdir():
+        if folder.is_dir():
+            # Extrahiert Kategorie und Unterkategorie aus dem Ordnernamen
+            parts = folder.name.split("_")
+            main_cat = ""
+            sub_cat = ""
+
+            if len(parts) >= 2:
+                main_cat = parts[0].strip()
+                sub_cat = parts[1].strip()
+            elif len(parts) == 1:
+                main_cat = parts[0].strip()
+                sub_cat = "Allgemein" # Standard-Unterkategorie, wenn keine angegeben ist
+            
+            # Überspringt Ordner, deren Namen nicht dem erwarteten Muster entsprechen
+            if not main_cat:
+                log.warning("Ordnername '%s' ist ungültig (keine erkennbare Kategorie_Unterkategorie-Struktur). Übersprungen.", folder.name)
+                continue
+
+            # Sammelt alle PNG-Dateien in diesem Unterordner
+            png_files_in_folder = list(folder.glob("*.png"))
+            if not png_files_in_folder:
+                log.info("Keine PNGs gefunden in Ordner '%s'.", folder.name)
+                continue
+
+            # Fügt die gefundenen PNGs zur Liste der zu verarbeitenden Dateien hinzu
+            for p in png_files_in_folder:
+                files_to_process.append((p, main_cat, sub_cat))
+            log.info("Gefunden: %d PNGs in Ordner '%s' (Kategorie: %s/%s)", len(png_files_in_folder), folder.name, main_cat, sub_cat)
+        else:
+            log.info("'%s' ist keine Verzeichnis. Übersprungen.", folder.name)
+
+    # Wenn keine Dateien gefunden wurden, beende das Skript
+    if not files_to_process:
+        log.info("Keine PNGs in den spezifizierten Ordnern zur Verarbeitung gefunden. Beende.")
+        return
+
+    log.info("Beginne Verarbeitung von %d Bildern mit %d parallelen Prozessen...", len(files_to_process), MAX_PARALLEL)
+    
+    # Initialisiert Statistiken
+    stats = {"processed": 0, "skipped": 0, "failed": 0}
+    # Startet den Thread-Pool für die parallele Verarbeitung
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+        # Reicht jede Datei als Aufgabe an den Thread-Pool weiter
+        futures = {pool.submit(process_png, p, mc, sc): p.name for p, mc, sc in files_to_process}
+        # Wartet, bis jede Aufgabe abgeschlossen ist, und sammelt die Ergebnisse
+        for fut in as_completed(futures):
+            png_name = futures[fut] # Holt den Original-Dateinamen für das Logging
+            try:
+                res = fut.result() # Holt das Ergebnis der Verarbeitung ("processed", "skipped", "failed")
+                stats[res] += 1 # Aktualisiert die Statistik
+                log.info("Status für %s: %s", png_name, res.upper())
+            except Exception as e:
+                stats["failed"] += 1 # Zählt Fehler
+                log.error("Unerwarteter Fehler beim Abrufen des Ergebnisses für %s: %s", png_name, e)
+
+    log.info("VERARBEITUNG ABGESCHLOSSEN – Statistik: %s", stats)
+
+# Startet die Hauptfunktion, wenn das Skript direkt ausgeführt wird
+if __name__ == "__main__":
+    main()
