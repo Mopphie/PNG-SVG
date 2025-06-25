@@ -26,6 +26,7 @@ Printable Content-Pipeline
 
 from __future__ import annotations
 import os, re, json, time, uuid, hashlib, tempfile, logging, threading, subprocess
+import xml.etree.ElementTree as ET
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -238,56 +239,40 @@ def check_inkscape():
         log.error("FEHLER: Inkscape --version gab einen Fehler zurück. Überprüfe die Inkscape-Installation. Fehlermeldung: %s", e.stderr.decode())
         raise SystemExit(f"Inkscape --version gab Fehler zurück: {e.stderr.decode()}")
 
-# Führt die Inkscape-Prüfung einmalig beim Skriptstart aus
 check_inkscape()
 
 def _ensure_black_fill_and_stroke(svg_content: str) -> str:
-    """
-    Stellt sicher, dass SVG-Pfade und Formen eine schwarze Füllung haben
-    und unerwünschte Striche entfernt werden.
-    """
-    # Regex, um gängige SVG-Form-Elemente zu finden (pfad, rect, circle, etc.)
-    # und deren Attribute zu erfassen.
-    pattern = re.compile(
-        r'<(path|rect|circle|ellipse|polygon|polyline|line)\s*([^>]*?)>',
-        re.IGNORECASE | re.DOTALL
-    )
+    """Stellt sicher, dass Pfade & Formen schwarz gefüllt und ohne Strich sind."""
 
-    def replace_attrs(match):
-        element_name = match.group(1)
-        attributes = match.group(2)  # Aktuelle Attribute als String
+    # Verhindert unerwünschte Namespace-Präfixe wie ``ns0`` in der Ausgabe
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
 
-        style_match = re.search(r'style\s*=\s*"([^"]*)"', attributes, re.IGNORECASE)
-        style = ""
-        if style_match:
-            style = style_match.group(1)
-            attributes = attributes[:style_match.start()] + attributes[style_match.end():]
+    try:
+        # Umgeht Parsing-Probleme mit Fragmenten, indem ein wrapper-<svg>
+        # ohne Namespace verwendet wird
+        wrapper = ET.fromstring(f"<svg>{svg_content}</svg>")
+    except ET.ParseError as e:
+        log.warning("SVG-Parsing-Fehler in _ensure_black_fill_and_stroke: %s", e)
+        return svg_content
 
-            # Passe vorhandene fill/stroke Angaben im style-Attribut an
-            if re.search(r'fill\s*:[^;"\']*', style, re.IGNORECASE):
-                style = re.sub(r'fill\s*:[^;"\']*', 'fill:#000000', style, flags=re.IGNORECASE)
-            else:
-                style += ';fill:#000000'
+    target_tags = {"path", "rect", "circle", "ellipse", "polygon", "polyline", "line"}
 
-            if re.search(r'stroke\s*:[^;"\']*', style, re.IGNORECASE):
-                style = re.sub(r'stroke\s*:[^;"\']*', 'stroke:none', style, flags=re.IGNORECASE)
-            else:
-                style += ';stroke:none'
-        else:
-            style = 'fill:#000000;stroke:none'
+    for elem in wrapper.iter():
+        tag = elem.tag.split("}")[-1]
+        if tag in target_tags:
+            elem.attrib.pop("fill", None)
+            elem.attrib.pop("stroke", None)
 
-        # Entferne explizite fill= oder stroke= Attribute außerhalb des style-Attributs
-        attributes = re.sub(r'fill\s*=\s*"[^"]*"', '', attributes, flags=re.IGNORECASE)
-        attributes = re.sub(r'stroke\s*=\s*"[^"]*"', '', attributes, flags=re.IGNORECASE)
+            style_str = elem.attrib.get("style", "")
+            style_pairs = [s.strip() for s in style_str.split(";") if s.strip() and ":" in s]
+            style_dict = {k.strip(): v.strip() for k, v in (p.split(":", 1) for p in style_pairs)}
+            style_dict["fill"] = "#000000"
+            style_dict["stroke"] = "none"
+            elem.attrib["style"] = ";".join(f"{k}:{v}" for k, v in style_dict.items())
 
-        attrs = attributes.strip()
-        if attrs:
-            attrs += ' '
-        attrs += f'style="{style}"'
-
-        return f'<{element_name} {attrs}>'  # .strip() entfernt ggf. überschüssige Leerzeichen
-
-    return pattern.sub(replace_attrs, svg_content)
+    inner = "".join(ET.tostring(child, encoding="unicode") for child in wrapper)
+    return inner
 
 
 def trace_png_to_svg(png_path: Path, svg_out: Path):
@@ -310,7 +295,7 @@ def trace_png_to_svg(png_path: Path, svg_out: Path):
     cmd = [INKSCAPE_PATH,
            "--batch-process",
            f"--actions=FileNew;FileImport:{png_path};EditSelectAll;SelectionTrace;ObjectToPath;SelectionUnGroup;FileSave;FileClose",
-           f"--export-type=svg",
+           "--export-type=svg",
            f"--export-filename={svg_out}",
            "--export-plain-svg",  # Exportiert ein "plain" SVG, oft kleiner und sauberer
            ]
