@@ -6,6 +6,7 @@ Printable Content-Pipeline
   mit vorherigem Kontrast-Boost
 • Erzeugt A4-SVGs mit Rand (Verhältnis 210:297) inklusive Style-Block
 • Erzeugt A4-Thumbnails (Breite fest, Höhe A4-Verhältnis)
+• Prüft automatisch die Qualität von SVG und Thumbnail
 • Analysiert Motive & Tags mit **Gemini Flash 1.5**
 • Übersetzt Titel + Tags in 20 Sprachen (Cache in SQLite)
 • Lädt SVG & Thumbnail nach Firebase Storage und legt Metadaten in Firestore ab
@@ -394,6 +395,63 @@ def create_thumbnail(svg_path: Path, thumb_out: Path):
         raise
     log.info("Thumbnail erfolgreich: %s", thumb_out.name)
 
+
+def _validate_svg(svg_path: Path) -> bool:
+    """Prüft grundlegende technische und visuelle Kriterien des SVG."""
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        log.error("SVG-Parsing-Fehler: %s", e)
+        return False
+
+    expected_w = int(A4_WIDTH_MM * DEFAULT_DPI / 25.4)
+    expected_h = int(A4_HEIGHT_MM * DEFAULT_DPI / 25.4)
+    width = root.get("width", "0").replace("px", "")
+    height = root.get("height", "0").replace("px", "")
+    try:
+        if int(float(width)) != expected_w or int(float(height)) != expected_h:
+            log.error("SVG hat unerwartete Dimensionen: %sx%s", width, height)
+            return False
+    except ValueError:
+        log.error("SVG width/height nicht numerisch: %s/%s", width, height)
+        return False
+
+    target_tags = {"path", "rect", "circle", "ellipse", "polygon", "polyline", "line"}
+    if not any(elem.tag.split('}')[-1] in target_tags for elem in root.iter()):
+        log.error("SVG enthält keine Vektorelemente")
+        return False
+
+    if "fill:#000" not in Path(svg_path).read_text(encoding="utf-8"):
+        log.error("SVG nicht schwarz gefärbt")
+        return False
+    return True
+
+
+def _validate_thumbnail(png_path: Path) -> bool:
+    """Prüft Größe, Seitenverhältnis und Kontrast des Thumbnails."""
+    try:
+        img = Image.open(png_path)
+    except Exception as e:
+        log.error("Thumbnail konnte nicht geöffnet werden: %s", e)
+        return False
+
+    if img.width != TARGET_THUMB_WIDTH_PX:
+        log.error("Thumbnail-Breite falsch: %d", img.width)
+        return False
+
+    expected_ratio = A4_HEIGHT_MM / A4_WIDTH_MM
+    actual_ratio = img.height / img.width
+    if abs(actual_ratio - expected_ratio) > THUMB_RATIO_TOLERANCE:
+        log.error("Thumbnail-Seitenverhältnis abweichend: %.3f", actual_ratio)
+        return False
+
+    lo, hi = img.convert("L").getextrema()
+    if hi - lo < 20:
+        log.error("Thumbnail-Kontrast zu niedrig")
+        return False
+    return True
+
 # ───────────────────────── STORAGE ─────────────────────────
 
 def upload(local: Path, blob_name: str, mime: str) -> str:
@@ -472,6 +530,9 @@ def process_png(png_path: Path, main_cat: str, sub_cat: str):
             trace_png_to_svg(png_path, svg_raw)
             create_a4_canvas(svg_raw, svg_a4)
             create_thumbnail(svg_a4, thumb_png) # Thumbnail aus dem A4-SVG erstellen
+
+            if not (_validate_svg(svg_a4) and _validate_thumbnail(thumb_png)):
+                raise ValueError("Qualitätsprüfung fehlgeschlagen")
 
             # Erzeugt einen URL-freundlichen "slug" für die Dateinamen in Firebase Storage
             # Bestehend aus bereinigtem Motiv und einem kurzen UUID für Eindeutigkeit
