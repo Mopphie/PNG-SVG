@@ -55,9 +55,12 @@ INKSCAPE_PATH         = os.getenv("INKSCAPE_PATH", "inkscape") # Standardmäßig
 DEFAULT_DPI           = int(os.getenv("DEFAULT_DPI", "96"))
 MAX_PARALLEL          = int(os.getenv("MAX_PARALLEL", "1")) # WICHTIG: Auf 1 gesetzt, um Gemini Quota-Limits zu vermeiden
 TARGET_THUMB_WIDTH_PX = int(os.getenv("THUMB_WIDTH", "350")) # Breite des A4-Thumbnails in Pixeln
+vn9i2t-codex/fix-svg-farbanzeige-probleme
 TRACE_THRESHOLD      = os.getenv("TRACE_THRESHOLD", "0.5")
 TRACE_PARAMS         = ["--image-trace-mode", "monochrome", "--image-trace-threshold", TRACE_THRESHOLD]
 THUMB_RATIO_TOLERANCE = float(os.getenv("THUMB_RATIO_TOLERANCE", "0.05"))
+=======
+TRACE_PARAMS         = ["--image-trace-mode", "monochrome", "--image-trace-threshold", "0.5"]
 
 # A4-Maße in Millimetern
 A4_WIDTH_MM, A4_HEIGHT_MM = 210, 297
@@ -270,6 +273,7 @@ def _ensure_black_fill_and_stroke(svg_content: str) -> str:
         style_dict["fill"] = "#000000"
         style_dict["stroke"] = "none"
         return 'style="' + ";".join(f"{k}:{v}" for k, v in style_dict.items()) + '"'
+ vn9i2t-codex/fix-svg-farbanzeige-probleme
 
     svg_content = re.sub(r'style="([^"]*)"', _replace_style, svg_content)
     svg_content = re.sub(r'fill="[^\"]*"', 'fill="#000000"', svg_content)
@@ -284,6 +288,19 @@ def preprocess_png(src: Path, dest: Path) -> None:
     bbox = ImageOps.invert(img).getbbox()
     if bbox:
         img = img.crop(bbox)
+=======
+
+    svg_content = re.sub(r'style="([^"]*)"', _replace_style, svg_content)
+    svg_content = re.sub(r'fill="[^\"]*"', 'fill="#000000"', svg_content)
+    svg_content = re.sub(r'stroke="[^\"]*"', 'stroke="none"', svg_content)
+    return svg_content
+
+
+def preprocess_png(src: Path, dest: Path) -> None:
+    """Verbessert den Kontrast eines PNG vor dem Tracing."""
+    img = Image.open(src).convert("L")
+    img = ImageOps.autocontrast(img)
+ main
     img.save(dest)
 
 
@@ -317,6 +334,7 @@ def trace_png_to_svg(png_path: Path, svg_out: Path):
             "--export-plain-svg",
         ]
         try:
+vn9i2t-codex/fix-svg-farbanzeige-probleme
             result = subprocess.run(
                 cmd,
                 check=True,
@@ -324,6 +342,8 @@ def trace_png_to_svg(png_path: Path, svg_out: Path):
                 text=True,
                 timeout=120,
             )
+=======
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True) main
             if not svg_out.exists() or svg_out.stat().st_size == 0:
                 log.error(
                     "Inkscape hat keine SVG-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
