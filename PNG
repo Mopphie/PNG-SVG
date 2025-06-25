@@ -264,8 +264,18 @@ def preprocess_png(src: Path, dest: Path) -> None:
     img = Image.open(src).convert("L")
     img = ImageOps.autocontrast(img)
     bbox = ImageOps.invert(img).getbbox()
+    log.info("Original Bounding Box: %s", bbox)
     if bbox:
-        img = img.crop(bbox)
+        # crop the image to its non-white bounding box but keep a small margin
+        # to avoid clipping lines that touch the border
+        left, top, right, bottom = bbox
+        margin = 10
+        left = max(left - margin, 0)
+        top = max(top - margin, 0)
+        right = min(right + margin, img.width)
+        bottom = min(bottom + margin, img.height)
+        img = img.crop((left, top, right, bottom))
+        log.info("Gecroppter Bereich mit Rand: (%d,%d,%d,%d)", left, top, right, bottom)
     img.save(dest)
 
 def trace_png_to_svg(png_path: Path, svg_out: Path):
@@ -307,9 +317,36 @@ def create_a4_canvas(svg_in: Path, svg_a4_out: Path):
     dpi = DEFAULT_DPI
     a4_w_px = int(A4_WIDTH_MM * dpi / 25.4)
     a4_h_px = int(A4_HEIGHT_MM * dpi / 25.4)
-    scale_factor = 0.9
-    translate_x = (a4_w_px * (1 - scale_factor)) / 2
-    translate_y = (a4_h_px * (1 - scale_factor)) / 2
+
+    raw_content = Path(svg_in).read_text(encoding="utf-8")
+    try:
+        root = ET.fromstring(raw_content)
+    except ET.ParseError as e:
+        log.error("SVG-Parsing fehlgeschlagen: %s", e)
+        raise
+
+    width_attr = root.get("width", "0").replace("px", "")
+    height_attr = root.get("height", "0").replace("px", "")
+    view_box = root.get("viewBox")
+    if view_box:
+        _, _, vb_w, vb_h = (float(v) for v in view_box.split())
+    else:
+        vb_w = float(width_attr) if width_attr else 0
+        vb_h = float(height_attr) if height_attr else 0
+
+    try:
+        width_px = float(width_attr) if width_attr else vb_w
+        height_px = float(height_attr) if height_attr else vb_h
+    except ValueError:
+        width_px = vb_w
+        height_px = vb_h
+
+    log.info("Raw SVG size %sx%s viewBox=%s", width_px, height_px, view_box)
+
+    scale_factor = min((a4_w_px * 0.9) / width_px, (a4_h_px * 0.9) / height_px)
+    translate_x = (a4_w_px - width_px * scale_factor) / 2
+    translate_y = (a4_h_px - height_px * scale_factor) / 2
+
     style_block = (
         "<style>path,rect,circle,ellipse,polygon,polyline,line{fill:#000000;stroke:none}</style>"
     )
@@ -319,21 +356,22 @@ def create_a4_canvas(svg_in: Path, svg_a4_out: Path):
      viewBox="0 0 {a4_w_px} {a4_h_px}"
      xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
   {style_block}
-  <g transform="translate({int(translate_x)},{int(translate_y)}) scale({scale_factor})">
+  <g transform="translate({translate_x:.2f},{translate_y:.2f}) scale({scale_factor:.5f})">
     {{content}}
   </g>
 </svg>"""
     )
-    full_raw_svg_content = Path(svg_in).read_text(encoding="utf-8")
-    match = re.search(r"<svg[^>]*?>(.*?)</svg>", full_raw_svg_content, re.DOTALL)
-    if match:
-        inner_svg_content = match.group(1).strip()
-    else:
+
+    inner_svg_content = "".join(ET.tostring(child, encoding="unicode") for child in list(root))
+    if not inner_svg_content:
         log.error(f"FEHLER: Konnte inneren SVG-Inhalt aus {svg_in.name} nicht extrahieren.")
-        inner_svg_content = full_raw_svg_content
+        inner_svg_content = raw_content
+
     inner_svg_content = _ensure_black_fill_and_stroke(inner_svg_content)
+
     with open(svg_a4_out, "w", encoding="utf-8") as fh:
         fh.write(template.replace("{content}", inner_svg_content))
+
     log.info("A4-Canvas erstellt: %s", svg_a4_out.name)
 
 def create_thumbnail(svg_path: Path, thumb_out: Path):
