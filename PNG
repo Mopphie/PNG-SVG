@@ -3,8 +3,10 @@
 Printable Content-Pipeline
 --------------------------
 • Wandelt PNG-Ausmalbilder in **echte SVG-Vektoren** (Trace Bitmap mit Inkscape)
-• Erzeugt A4-SVGs mit Rand (Verhältnis 210:297)
+  mit vorherigem Kontrast-Boost
+• Erzeugt A4-SVGs mit Rand (Verhältnis 210:297) inklusive Style-Block
 • Erzeugt A4-Thumbnails (Breite fest, Höhe A4-Verhältnis)
+• Prüft automatisch die Qualität von SVG und Thumbnail
 • Analysiert Motive & Tags mit **Gemini Flash 1.5**
 • Übersetzt Titel + Tags in 20 Sprachen (Cache in SQLite)
 • Lädt SVG & Thumbnail nach Firebase Storage und legt Metadaten in Firestore ab
@@ -36,7 +38,7 @@ import socket # Für SocketException
 import urllib3.exceptions # Für ProtocolError (falls urllib3 verwendet wird)
 
 from dotenv import load_dotenv # Benötigt: pip install python-dotenv
-from PIL import Image # Benötigt: pip install pillow
+from PIL import Image, ImageOps # Benötigt: pip install pillow
 import google.generativeai as genai # Benötigt: pip install google-generativeai
 from google.api_core import exceptions as google_api_exceptions # WICHTIG: Für API-Fehlerbehandlung
 import firebase_admin # Benötigt: pip install firebase-admin
@@ -53,6 +55,8 @@ INKSCAPE_PATH         = os.getenv("INKSCAPE_PATH", "inkscape") # Standardmäßig
 DEFAULT_DPI           = 96 # Standard-DPI für Inkscape-Berechnungen
 MAX_PARALLEL          = int(os.getenv("MAX_PARALLEL", "1")) # WICHTIG: Auf 1 gesetzt, um Gemini Quota-Limits zu vermeiden
 TARGET_THUMB_WIDTH_PX = int(os.getenv("THUMB_WIDTH", "350")) # Breite des A4-Thumbnails in Pixeln
+TRACE_PARAMS         = ["--image-trace-mode", "monochrome", "--image-trace-threshold", "0.5"]
+THUMB_RATIO_TOLERANCE = 0.05  # Toleranz für Seitenverhältnis-Prüfung
 
 # A4-Maße in Millimetern
 A4_WIDTH_MM, A4_HEIGHT_MM = 210, 297
@@ -242,35 +246,27 @@ def check_inkscape():
 check_inkscape()
 
 def _ensure_black_fill_and_stroke(svg_content: str) -> str:
-    """Setzt Füllung auf schwarz und entfernt Striche für SVG-Formelemente."""
+    """Erzwingt schwarze Füllung und entfernt Striche über String-Manipulation."""
 
-    try:
-        wrapper = ET.fromstring(
-            f'<svg xmlns="http://www.w3.org/2000/svg">{svg_content}</svg>'
-        )
-    except ET.ParseError as e:
-        log.warning("SVG-Parsing-Fehler in _ensure_black_fill_and_stroke: %s", e)
-        return svg_content
+    def _replace_style(match: re.Match) -> str:
+        style = match.group(1)
+        pairs = [s.strip() for s in style.split(";") if ":" in s]
+        style_dict = {k.strip(): v.strip() for k, v in (p.split(":", 1) for p in pairs)}
+        style_dict["fill"] = "#000000"
+        style_dict["stroke"] = "none"
+        return 'style="' + ";".join(f"{k}:{v}" for k, v in style_dict.items()) + '"'
 
-    target_tags = {
-        "path", "rect", "circle", "ellipse", "polygon", "polyline", "line"
-    }
+    svg_content = re.sub(r'style="([^"]*)"', _replace_style, svg_content)
+    svg_content = re.sub(r'fill="[^\"]*"', 'fill="#000000"', svg_content)
+    svg_content = re.sub(r'stroke="[^\"]*"', 'stroke="none"', svg_content)
+    return svg_content
 
-    for elem in wrapper.iter():
-        tag = elem.tag.split('}')[-1]
-        if tag in target_tags:
-            elem.attrib.pop("fill", None)
-            elem.attrib.pop("stroke", None)
 
-            style_str = elem.attrib.get("style", "")
-            style_pairs = [s.strip() for s in style_str.split(";") if s.strip() and ":" in s]
-            style_dict = {k.strip(): v.strip() for k, v in (p.split(":", 1) for p in style_pairs)}
-            style_dict["fill"] = "#000000"
-            style_dict["stroke"] = "none"
-            elem.attrib["style"] = ";".join(f"{k}:{v}" for k, v in style_dict.items())
-
-    inner = "".join(ET.tostring(child, encoding="unicode") for child in wrapper)
-    return inner
+def preprocess_png(src: Path, dest: Path) -> None:
+    """Verbessert den Kontrast eines PNG vor dem Tracing."""
+    img = Image.open(src).convert("L")
+    img = ImageOps.autocontrast(img)
+    img.save(dest)
 
 
 def trace_png_to_svg(png_path: Path, svg_out: Path):
@@ -290,24 +286,37 @@ def trace_png_to_svg(png_path: Path, svg_out: Path):
     # ObjectToPath: Wandelt das Ergebnis in Pfade um (statt eingebettetem Bild).
     # SelectionUnGroup: Entgruppiert ggf. entstandene Gruppen.
     # FileSave;FileClose: Speichert und schließt das Dokument.
-    cmd = [INKSCAPE_PATH,
-           "--batch-process",
-           f"--actions=FileNew;FileImport:{png_path};EditSelectAll;SelectionTrace;ObjectToPath;SelectionUnGroup;FileSave;FileClose",
-           "--export-type=svg",
-           f"--export-filename={svg_out}",
-           "--export-plain-svg",  # Exportiert ein "plain" SVG, oft kleiner und sauberer
-           ]
-    try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        # Überprüfen, ob die SVG-Datei tatsächlich erstellt und nicht leer ist
-        if not svg_out.exists() or svg_out.stat().st_size == 0:
-            log.error("Inkscape hat keine SVG-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
-                      svg_out, result.stdout, result.stderr)
-            raise RuntimeError(f"Inkscape hat keine SVG-Datei erstellt oder sie ist leer: {svg_out}")
-    except subprocess.CalledProcessError as e:
-        log.error("Inkscape Vektorisierung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
-                  png_path.name, e, e.stdout, e.stderr)
-        raise
+    with tempfile.TemporaryDirectory() as tdir:
+        prep = Path(tdir) / "pre.png"
+        preprocess_png(png_path, prep)
+        cmd = [
+            INKSCAPE_PATH,
+            "--batch-process",
+            *TRACE_PARAMS,
+            f"--actions=FileNew;FileImport:{prep};EditSelectAll;SelectionTrace;ObjectToPath;SelectionUnGroup;FileSave;FileClose",
+            "--export-type=svg",
+            f"--export-filename={svg_out}",
+            "--export-plain-svg",
+        ]
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            if not svg_out.exists() or svg_out.stat().st_size == 0:
+                log.error(
+                    "Inkscape hat keine SVG-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
+                    svg_out,
+                    result.stdout,
+                    result.stderr,
+                )
+                raise RuntimeError(f"Inkscape hat keine SVG-Datei erstellt oder sie ist leer: {svg_out}")
+        except subprocess.CalledProcessError as e:
+            log.error(
+                "Inkscape Vektorisierung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
+                png_path.name,
+                e,
+                e.stdout,
+                e.stderr,
+            )
+            raise
     log.info("Vektorisierung erfolgreich: %s", svg_out.name)
 
 
@@ -326,10 +335,14 @@ def create_a4_canvas(svg_in: Path, svg_a4_out: Path):
 
     # NEUER FIX: width und height im SVG-Root-Tag in Pixeln angegeben, passend zum viewBox
     # WICHTIG: Das weiße <rect> im Template wurde entfernt, da Drucker ohnehin Papier füllen.
+    style_block = (
+        "<style>path,rect,circle,ellipse,polygon,polyline,line{" "fill:#000;stroke:none" "}</style>"
+    )
     template = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg width="{a4_w_px}px" height="{a4_h_px}px" 
+<svg width="{a4_w_px}px" height="{a4_h_px}px"
      viewBox="0 0 {a4_w_px} {a4_h_px}"
      xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  {style_block}
   <g transform="translate({int(translate_x)},{int(translate_y)}) scale({scale_factor})">
     {{content}}
   </g>
@@ -375,12 +388,70 @@ def create_thumbnail(svg_path: Path, thumb_out: Path):
 
         # NEU: Zusätzliche Komprimierung des PNG mit Pillow für kleinere Dateigröße
         img = Image.open(thumb_out)
-        img.save(thumb_out, optimize=True, compress_level=9) # compress_level=9 für höchste Komprimierung
+        img = ImageOps.autocontrast(img.convert("L")).convert("RGB")
+        img.save(thumb_out, optimize=True, compress_level=9)
     except subprocess.CalledProcessError as e:
         log.error("Inkscape Thumbnail-Erstellung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
                   svg_path.name, e, e.stdout, e.stderr)
         raise
     log.info("Thumbnail erfolgreich: %s", thumb_out.name)
+
+
+def _validate_svg(svg_path: Path) -> bool:
+    """Prüft grundlegende technische und visuelle Kriterien des SVG."""
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        log.error("SVG-Parsing-Fehler: %s", e)
+        return False
+
+    expected_w = int(A4_WIDTH_MM * DEFAULT_DPI / 25.4)
+    expected_h = int(A4_HEIGHT_MM * DEFAULT_DPI / 25.4)
+    width = root.get("width", "0").replace("px", "")
+    height = root.get("height", "0").replace("px", "")
+    try:
+        if int(float(width)) != expected_w or int(float(height)) != expected_h:
+            log.error("SVG hat unerwartete Dimensionen: %sx%s", width, height)
+            return False
+    except ValueError:
+        log.error("SVG width/height nicht numerisch: %s/%s", width, height)
+        return False
+
+    target_tags = {"path", "rect", "circle", "ellipse", "polygon", "polyline", "line"}
+    if not any(elem.tag.split('}')[-1] in target_tags for elem in root.iter()):
+        log.error("SVG enthält keine Vektorelemente")
+        return False
+
+    if "fill:#000" not in Path(svg_path).read_text(encoding="utf-8"):
+        log.error("SVG nicht schwarz gefärbt")
+        return False
+    return True
+
+
+def _validate_thumbnail(png_path: Path) -> bool:
+    """Prüft Größe, Seitenverhältnis und Kontrast des Thumbnails."""
+    try:
+        img = Image.open(png_path)
+    except Exception as e:
+        log.error("Thumbnail konnte nicht geöffnet werden: %s", e)
+        return False
+
+    if img.width != TARGET_THUMB_WIDTH_PX:
+        log.error("Thumbnail-Breite falsch: %d", img.width)
+        return False
+
+    expected_ratio = A4_HEIGHT_MM / A4_WIDTH_MM
+    actual_ratio = img.height / img.width
+    if abs(actual_ratio - expected_ratio) > THUMB_RATIO_TOLERANCE:
+        log.error("Thumbnail-Seitenverhältnis abweichend: %.3f", actual_ratio)
+        return False
+
+    lo, hi = img.convert("L").getextrema()
+    if hi - lo < 20:
+        log.error("Thumbnail-Kontrast zu niedrig")
+        return False
+    return True
 
 # ───────────────────────── STORAGE ─────────────────────────
 
@@ -460,6 +531,9 @@ def process_png(png_path: Path, main_cat: str, sub_cat: str):
             trace_png_to_svg(png_path, svg_raw)
             create_a4_canvas(svg_raw, svg_a4)
             create_thumbnail(svg_a4, thumb_png) # Thumbnail aus dem A4-SVG erstellen
+
+            if not (_validate_svg(svg_a4) and _validate_thumbnail(thumb_png)):
+                raise ValueError("Qualitätsprüfung fehlgeschlagen")
 
             # Erzeugt einen URL-freundlichen "slug" für die Dateinamen in Firebase Storage
             # Bestehend aus bereinigtem Motiv und einem kurzen UUID für Eindeutigkeit
