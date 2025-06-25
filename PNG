@@ -2,16 +2,19 @@
 """
 Printable Content-Pipeline
 --------------------------
-• Wandelt PNG-Ausmalbilder in **echte SVG-Vektoren** (Trace Bitmap mit Inkscape)
-• Erzeugt A4-SVGs mit Rand (Verhältnis 210:297)
+• Wandelt PNG-Ausmalbilder in **echte SVG-Vektoren** über *potrace*
+  (mit vorherigem Kontrast-Boost)
+• Erzeugt A4-SVGs mit Rand (Verhältnis 210:297) inklusive Style-Block
 • Erzeugt A4-Thumbnails (Breite fest, Höhe A4-Verhältnis)
+• Prüft automatisch die Qualität von SVG und Thumbnail
 • Analysiert Motive & Tags mit **Gemini Flash 1.5**
 • Übersetzt Titel + Tags in 20 Sprachen (Cache in SQLite)
 • Lädt SVG & Thumbnail nach Firebase Storage und legt Metadaten in Firestore ab
 
 ‼ VORAUSSETZUNGEN
-    🖼️ Inkscape ≥ 1.3    (muss im System-PATH sein oder INKSCAPE_PATH in .env setzen)
-                         (Manuelle Anpassung der Inkscape Trace Bitmap Standardeinstellungen ist jetzt OPTIONAL, da Skript Parameter setzt)
+    🖼️ Inkscape ≥ 1.2  (muss im System-PATH sein oder INKSCAPE_PATH in .env setzen)
+    🖼️ potrace         (für die Bitmap-Vektorisierung, ebenfalls im PATH erwartet)
+                         (Manuelle Anpassung der Inkscape-Export-Parameter ist optional)
     🔑 Umgebungsvariablen (oder .env) →  GEMINI_API_KEY, FIREBASE_CREDENTIALS, FIREBASE_BUCKET
     🐍 pip install -r requirements.txt
         (Liste der benötigten Pakete für requirements.txt:
@@ -36,7 +39,7 @@ import socket # Für SocketException
 import urllib3.exceptions # Für ProtocolError (falls urllib3 verwendet wird)
 
 from dotenv import load_dotenv # Benötigt: pip install python-dotenv
-from PIL import Image # Benötigt: pip install pillow
+from PIL import Image, ImageOps # Benötigt: pip install pillow
 import google.generativeai as genai # Benötigt: pip install google-generativeai
 from google.api_core import exceptions as google_api_exceptions # WICHTIG: Für API-Fehlerbehandlung
 import firebase_admin # Benötigt: pip install firebase-admin
@@ -50,9 +53,12 @@ GEMINI_API_KEY        = os.environ["GEMINI_API_KEY"]
 FIREBASE_CREDENTIALS  = os.environ["FIREBASE_CREDENTIALS"] 
 FIREBASE_BUCKET       = os.environ["FIREBASE_BUCKET"] # Muss "projekt-id.appspot.com" sein
 INKSCAPE_PATH         = os.getenv("INKSCAPE_PATH", "inkscape") # Standardmäßig "inkscape", sucht im PATH
-DEFAULT_DPI           = 96 # Standard-DPI für Inkscape-Berechnungen
+POTRACE_PATH          = os.getenv("POTRACE_PATH", "potrace")   # Pfad zu potrace
+DEFAULT_DPI           = int(os.getenv("DEFAULT_DPI", "96"))
 MAX_PARALLEL          = int(os.getenv("MAX_PARALLEL", "1")) # WICHTIG: Auf 1 gesetzt, um Gemini Quota-Limits zu vermeiden
 TARGET_THUMB_WIDTH_PX = int(os.getenv("THUMB_WIDTH", "350")) # Breite des A4-Thumbnails in Pixeln
+TRACE_THRESHOLD      = os.getenv("TRACE_THRESHOLD", "0.5")
+THUMB_RATIO_TOLERANCE = float(os.getenv("THUMB_RATIO_TOLERANCE", "0.05"))
 
 # A4-Maße in Millimetern
 A4_WIDTH_MM, A4_HEIGHT_MM = 210, 297
@@ -79,34 +85,42 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ─────────────── FIREBASE / GEMINI INITIALISIERUNG ─────────
-# Initialisiert Firebase nur einmal, wenn die App noch nicht initialisiert wurde
-if not firebase_admin._apps:
+_db: firestore.Client | None = None
+_bucket: storage.Bucket | None = None
+MODEL_IMAGE = None
+MODEL_TRANS = None
+
+
+def _initialize_services() -> None:
+    """Initialisiert Firebase und Gemini, falls noch nicht geschehen."""
+    global _db, _bucket, MODEL_IMAGE, MODEL_TRANS
+    if _db is not None:
+        return
+
     try:
-        # Versucht, FIREBASE_CREDENTIALS als Dateipfad zu laden (empfohlen)
         if os.path.isfile(FIREBASE_CREDENTIALS):
             cred = credentials.Certificate(FIREBASE_CREDENTIALS)
             log.info("Firebase-Credentials als Dateipfad erkannt und geladen.")
         else:
-            # Fallback: Versucht, FIREBASE_CREDENTIALS als JSON-String zu parsen
             cred_dict = json.loads(FIREBASE_CREDENTIALS)
             cred = credentials.Certificate(cred_dict)
             log.info("Firebase-Credentials als JSON-String erkannt und geladen.")
     except (json.JSONDecodeError, ValueError) as e:
-        log.error("FEHLER: FIREBASE_CREDENTIALS ist ungültig (weder gültiger JSON-String noch existierender Dateipfad). Details: %s", e)
-        # Beendet das Skript, da Firebase nicht initialisiert werden kann
-        raise SystemExit("Firebase-Initialisierung fehlgeschlagen. Bitte FIREBASE_CREDENTIALS in der .env-Datei überprüfen.")
+        log.error(
+            "FEHLER: FIREBASE_CREDENTIALS ist ungültig (weder gültiger JSON-String noch existierender Dateipfad). Details: %s",
+            e,
+        )
+        raise SystemExit(
+            "Firebase-Initialisierung fehlgeschlagen. Bitte FIREBASE_CREDENTIALS in der .env-Datei überprüfen."
+        )
 
-    # Initialisiert die Firebase Admin SDK-App
     firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_BUCKET})
+    _db = firestore.client()
+    _bucket = storage.bucket()
 
-# Firestore-Client und Storage-Bucket instanziieren
-_db: firestore.Client = firestore.client()
-_bucket: storage.Bucket = storage.bucket()
-
-# Gemini-Modelle konfigurieren
-genai.configure(api_key=GEMINI_API_KEY)
-MODEL_IMAGE = genai.GenerativeModel("gemini-1.5-flash") # Modell für Bildanalyse
-MODEL_TRANS = genai.GenerativeModel("gemini-1.5-flash") # Modell für Übersetzungen
+    genai.configure(api_key=GEMINI_API_KEY)
+    MODEL_IMAGE = genai.GenerativeModel("gemini-1.5-flash")
+    MODEL_TRANS = genai.GenerativeModel("gemini-1.5-flash")
 
 # ────────────────────── HILFSKLASSEN ───────────────────────
 class RateLimiter:
@@ -231,7 +245,13 @@ def translate(text: str, lang_name: str, lang_code: str):
 def check_inkscape():
     """Prüft beim Start des Skripts, ob Inkscape im Systempfad verfügbar ist."""
     try:
-        subprocess.run([INKSCAPE_PATH, "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            [INKSCAPE_PATH, "--version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
     except FileNotFoundError:
         log.error("FEHLER: Inkscape wurde nicht gefunden. Bitte installiere es oder setze den korrekten Pfad in der INKSCAPE_PATH-Umgebungsvariable (oder in .env).")
         raise SystemExit("Inkscape nicht gefunden.")
@@ -241,73 +261,103 @@ def check_inkscape():
 
 check_inkscape()
 
-def _ensure_black_fill_and_stroke(svg_content: str) -> str:
-    """Setzt Füllung auf schwarz und entfernt Striche für SVG-Formelemente."""
-
+def check_potrace():
+    """Stellt sicher, dass ``potrace`` installiert ist."""
     try:
-        wrapper = ET.fromstring(
-            f'<svg xmlns="http://www.w3.org/2000/svg">{svg_content}</svg>'
+        subprocess.run(
+            [POTRACE_PATH, "--version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
         )
-    except ET.ParseError as e:
-        log.warning("SVG-Parsing-Fehler in _ensure_black_fill_and_stroke: %s", e)
-        return svg_content
+    except FileNotFoundError:
+        log.error(
+            "FEHLER: potrace wurde nicht gefunden. Bitte installiere es oder setze POTRACE_PATH."
+        )
+        raise SystemExit("potrace nicht gefunden.")
+    except subprocess.CalledProcessError as e:
+        log.error(
+            "FEHLER: potrace --version gab einen Fehler zurück. Fehlermeldung: %s",
+            e.stderr.decode(),
+        )
+        raise SystemExit(f"potrace --version gab Fehler zurück: {e.stderr.decode()}")
 
-    target_tags = {
-        "path", "rect", "circle", "ellipse", "polygon", "polyline", "line"
-    }
+check_potrace()
 
-    for elem in wrapper.iter():
-        tag = elem.tag.split('}')[-1]
-        if tag in target_tags:
-            elem.attrib.pop("fill", None)
-            elem.attrib.pop("stroke", None)
+def _ensure_black_fill_and_stroke(svg_content: str) -> str:
+    """Erzwingt schwarze Füllung und entfernt Striche über String-Manipulation."""
 
-            style_str = elem.attrib.get("style", "")
-            style_pairs = [s.strip() for s in style_str.split(";") if s.strip() and ":" in s]
-            style_dict = {k.strip(): v.strip() for k, v in (p.split(":", 1) for p in style_pairs)}
-            style_dict["fill"] = "#000000"
-            style_dict["stroke"] = "none"
-            elem.attrib["style"] = ";".join(f"{k}:{v}" for k, v in style_dict.items())
+    def _replace_style(match: re.Match) -> str:
+        style = match.group(1)
+        pairs = [s.strip() for s in style.split(";") if ":" in s]
+        style_dict = {k.strip(): v.strip() for k, v in (p.split(":", 1) for p in pairs)}
+        style_dict["fill"] = "#000000"
+        style_dict["stroke"] = "none"
+        return 'style="' + ";".join(f"{k}:{v}" for k, v in style_dict.items()) + '"'
 
-    inner = "".join(ET.tostring(child, encoding="unicode") for child in wrapper)
-    return inner
+    svg_content = re.sub(r'style="([^"]*)"', _replace_style, svg_content)
+    svg_content = re.sub(r'fill="[^\"]*"', 'fill="#000000"', svg_content)
+    svg_content = re.sub(r'stroke="[^\"]*"', 'stroke="none"', svg_content)
+    return svg_content
+
+
+def preprocess_png(src: Path, dest: Path) -> None:
+    """Verbessert Kontrast und entfernt weiße Ränder vor dem Tracing."""
+    img = Image.open(src).convert("L")
+    img = ImageOps.autocontrast(img)
+    bbox = ImageOps.invert(img).getbbox()
+    if bbox:
+        img = img.crop(bbox)
+    img.save(dest)
 
 
 def trace_png_to_svg(png_path: Path, svg_out: Path):
-    """
-    Vektorisiert ein PNG zu einem SVG.  Inkscape ≥1.3 nutzt "SelectionTrace"
-    über ``--actions``.  Die ehemals verfügbaren ``--trace-bitmap*`` Flags sind
-    veraltet und wurden entfernt, sodass die aktuell gespeicherten
-    Vektorisierungseinstellungen greifen.
-    """
-    log.info("Vektorisierung von %s...", png_path.name)
-    # --actions:
-    # FileNew: Erstellt ein neues leeres Dokument.
-    # FileImport:{png_path}: Importiert das PNG in das neue Dokument.
-    # EditSelectAll: Wählt alle Objekte im Dokument aus (jetzt das importierte PNG).
-    # SelectionTrace: Führt die Vektorisierung aus (verwendet die in Inkscape
-    # gespeicherten Parameter).
-    # ObjectToPath: Wandelt das Ergebnis in Pfade um (statt eingebettetem Bild).
-    # SelectionUnGroup: Entgruppiert ggf. entstandene Gruppen.
-    # FileSave;FileClose: Speichert und schließt das Dokument.
-    cmd = [INKSCAPE_PATH,
-           "--batch-process",
-           f"--actions=FileNew;FileImport:{png_path};EditSelectAll;SelectionTrace;ObjectToPath;SelectionUnGroup;FileSave;FileClose",
-           "--export-type=svg",
-           f"--export-filename={svg_out}",
-           "--export-plain-svg",  # Exportiert ein "plain" SVG, oft kleiner und sauberer
-           ]
-    try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        # Überprüfen, ob die SVG-Datei tatsächlich erstellt und nicht leer ist
-        if not svg_out.exists() or svg_out.stat().st_size == 0:
-            log.error("Inkscape hat keine SVG-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
-                      svg_out, result.stdout, result.stderr)
-            raise RuntimeError(f"Inkscape hat keine SVG-Datei erstellt oder sie ist leer: {svg_out}")
-    except subprocess.CalledProcessError as e:
-        log.error("Inkscape Vektorisierung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
-                  png_path.name, e, e.stdout, e.stderr)
-        raise
+    """Vektorisiert ein PNG zu einem SVG mithilfe von ``potrace``."""
+    log.info("Vektorisierung von %s mit potrace...", png_path.name)
+    with tempfile.TemporaryDirectory() as tdir:
+        prep = Path(tdir) / "pre.png"
+        preprocess_png(png_path, prep)
+
+        pgm = Path(tdir) / "pre.pgm"
+        Image.open(prep).convert("L").save(pgm)
+
+        cmd = [
+            POTRACE_PATH,
+            str(pgm),
+            "-s",
+            "-o",
+            str(svg_out),
+            "-k",
+            str(TRACE_THRESHOLD),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if not svg_out.exists() or svg_out.stat().st_size == 0:
+                log.error(
+                    "potrace hat keine SVG-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
+                    svg_out,
+                    result.stdout,
+                    result.stderr,
+                )
+                raise RuntimeError(
+                    f"potrace hat keine SVG-Datei erstellt oder sie ist leer: {svg_out}"
+                )
+        except subprocess.CalledProcessError as e:
+            log.error(
+                "potrace Vektorisierung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
+                png_path.name,
+                e,
+                e.stdout,
+                e.stderr,
+            )
+            raise
     log.info("Vektorisierung erfolgreich: %s", svg_out.name)
 
 
@@ -326,10 +376,14 @@ def create_a4_canvas(svg_in: Path, svg_a4_out: Path):
 
     # NEUER FIX: width und height im SVG-Root-Tag in Pixeln angegeben, passend zum viewBox
     # WICHTIG: Das weiße <rect> im Template wurde entfernt, da Drucker ohnehin Papier füllen.
+    style_block = (
+        "<style>path,rect,circle,ellipse,polygon,polyline,line{{fill:#000;stroke:none}}</style>"
+    )
     template = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg width="{a4_w_px}px" height="{a4_h_px}px" 
+<svg width="{a4_w_px}px" height="{a4_h_px}px"
      viewBox="0 0 {a4_w_px} {a4_h_px}"
      xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  {style_block}
   <g transform="translate({int(translate_x)},{int(translate_y)}) scale({scale_factor})">
     {{content}}
   </g>
@@ -367,7 +421,13 @@ def create_thumbnail(svg_path: Path, thumb_out: Path):
            "--export-background=white", # Stellt sicher, dass der Hintergrund weiß ist
            "--export-filename", str(thumb_out)] # Explizite Angabe von --export-filename für Robustheit
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         if not thumb_out.exists() or thumb_out.stat().st_size == 0:
             log.error("Inkscape hat keine Thumbnail-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
                       thumb_out, result.stdout, result.stderr)
@@ -375,12 +435,70 @@ def create_thumbnail(svg_path: Path, thumb_out: Path):
 
         # NEU: Zusätzliche Komprimierung des PNG mit Pillow für kleinere Dateigröße
         img = Image.open(thumb_out)
-        img.save(thumb_out, optimize=True, compress_level=9) # compress_level=9 für höchste Komprimierung
+        img = ImageOps.autocontrast(img.convert("L")).convert("RGB")
+        img.save(thumb_out, optimize=True, compress_level=9)
     except subprocess.CalledProcessError as e:
         log.error("Inkscape Thumbnail-Erstellung fehlgeschlagen für %s: %s (stdout: %s, stderr: %s)",
                   svg_path.name, e, e.stdout, e.stderr)
         raise
     log.info("Thumbnail erfolgreich: %s", thumb_out.name)
+
+
+def _validate_svg(svg_path: Path) -> bool:
+    """Prüft grundlegende technische und visuelle Kriterien des SVG."""
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        log.error("SVG-Parsing-Fehler: %s", e)
+        return False
+
+    expected_w = int(A4_WIDTH_MM * DEFAULT_DPI / 25.4)
+    expected_h = int(A4_HEIGHT_MM * DEFAULT_DPI / 25.4)
+    width = root.get("width", "0").replace("px", "")
+    height = root.get("height", "0").replace("px", "")
+    try:
+        if int(float(width)) != expected_w or int(float(height)) != expected_h:
+            log.error("SVG hat unerwartete Dimensionen: %sx%s", width, height)
+            return False
+    except ValueError:
+        log.error("SVG width/height nicht numerisch: %s/%s", width, height)
+        return False
+
+    target_tags = {"path", "rect", "circle", "ellipse", "polygon", "polyline", "line"}
+    if not any(elem.tag.split('}')[-1] in target_tags for elem in root.iter()):
+        log.error("SVG enthält keine Vektorelemente")
+        return False
+
+    if "fill:#000" not in Path(svg_path).read_text(encoding="utf-8"):
+        log.error("SVG nicht schwarz gefärbt")
+        return False
+    return True
+
+
+def _validate_thumbnail(png_path: Path) -> bool:
+    """Prüft Größe, Seitenverhältnis und Kontrast des Thumbnails."""
+    try:
+        img = Image.open(png_path)
+    except Exception as e:
+        log.error("Thumbnail konnte nicht geöffnet werden: %s", e)
+        return False
+
+    if img.width != TARGET_THUMB_WIDTH_PX:
+        log.error("Thumbnail-Breite falsch: %d", img.width)
+        return False
+
+    expected_ratio = A4_HEIGHT_MM / A4_WIDTH_MM
+    actual_ratio = img.height / img.width
+    if abs(actual_ratio - expected_ratio) > THUMB_RATIO_TOLERANCE:
+        log.error("Thumbnail-Seitenverhältnis abweichend: %.3f", actual_ratio)
+        return False
+
+    lo, hi = img.convert("L").getextrema()
+    if hi - lo < 20:
+        log.error("Thumbnail-Kontrast zu niedrig")
+        return False
+    return True
 
 # ───────────────────────── STORAGE ─────────────────────────
 
@@ -416,7 +534,8 @@ def process_png(png_path: Path, main_cat: str, sub_cat: str):
     7. Löscht das Original-PNG (falls erfolgreich).
     """
     log.info("Starte Verarbeitung von Bild: %s (Kategorie: %s/%s)", png_path.name, main_cat, sub_cat)
-    
+
+    _initialize_services()
     file_hash = sha256(png_path)
     
     # Prüft, ob das Bild bereits verarbeitet wurde
@@ -460,6 +579,9 @@ def process_png(png_path: Path, main_cat: str, sub_cat: str):
             trace_png_to_svg(png_path, svg_raw)
             create_a4_canvas(svg_raw, svg_a4)
             create_thumbnail(svg_a4, thumb_png) # Thumbnail aus dem A4-SVG erstellen
+
+            if not (_validate_svg(svg_a4) and _validate_thumbnail(thumb_png)):
+                raise ValueError("Qualitätsprüfung fehlgeschlagen")
 
             # Erzeugt einen URL-freundlichen "slug" für die Dateinamen in Firebase Storage
             # Bestehend aus bereinigtem Motiv und einem kurzen UUID für Eindeutigkeit
