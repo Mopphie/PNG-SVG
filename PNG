@@ -56,7 +56,6 @@ DEFAULT_DPI           = 96 # Standard-DPI für Inkscape-Berechnungen
 MAX_PARALLEL          = int(os.getenv("MAX_PARALLEL", "1")) # WICHTIG: Auf 1 gesetzt, um Gemini Quota-Limits zu vermeiden
 TARGET_THUMB_WIDTH_PX = int(os.getenv("THUMB_WIDTH", "350")) # Breite des A4-Thumbnails in Pixeln
 TRACE_PARAMS         = ["--image-trace-mode", "monochrome", "--image-trace-threshold", "0.5"]
-THUMB_RATIO_TOLERANCE = 0.05  # Toleranz für Seitenverhältnis-Prüfung
 
 # A4-Maße in Millimetern
 A4_WIDTH_MM, A4_HEIGHT_MM = 210, 297
