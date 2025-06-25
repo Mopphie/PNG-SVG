@@ -52,9 +52,14 @@ GEMINI_API_KEY        = os.environ["GEMINI_API_KEY"]
 FIREBASE_CREDENTIALS  = os.environ["FIREBASE_CREDENTIALS"] 
 FIREBASE_BUCKET       = os.environ["FIREBASE_BUCKET"] # Muss "projekt-id.appspot.com" sein
 INKSCAPE_PATH         = os.getenv("INKSCAPE_PATH", "inkscape") # Standardmäßig "inkscape", sucht im PATH
-DEFAULT_DPI           = 96 # Standard-DPI für Inkscape-Berechnungen
+DEFAULT_DPI           = int(os.getenv("DEFAULT_DPI", "96"))
 MAX_PARALLEL          = int(os.getenv("MAX_PARALLEL", "1")) # WICHTIG: Auf 1 gesetzt, um Gemini Quota-Limits zu vermeiden
 TARGET_THUMB_WIDTH_PX = int(os.getenv("THUMB_WIDTH", "350")) # Breite des A4-Thumbnails in Pixeln
+vn9i2t-codex/fix-svg-farbanzeige-probleme
+TRACE_THRESHOLD      = os.getenv("TRACE_THRESHOLD", "0.5")
+TRACE_PARAMS         = ["--image-trace-mode", "monochrome", "--image-trace-threshold", TRACE_THRESHOLD]
+THUMB_RATIO_TOLERANCE = float(os.getenv("THUMB_RATIO_TOLERANCE", "0.05"))
+=======
 TRACE_PARAMS         = ["--image-trace-mode", "monochrome", "--image-trace-threshold", "0.5"]
 
 # A4-Maße in Millimetern
@@ -242,7 +247,13 @@ def translate(text: str, lang_name: str, lang_code: str):
 def check_inkscape():
     """Prüft beim Start des Skripts, ob Inkscape im Systempfad verfügbar ist."""
     try:
-        subprocess.run([INKSCAPE_PATH, "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            [INKSCAPE_PATH, "--version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
     except FileNotFoundError:
         log.error("FEHLER: Inkscape wurde nicht gefunden. Bitte installiere es oder setze den korrekten Pfad in der INKSCAPE_PATH-Umgebungsvariable (oder in .env).")
         raise SystemExit("Inkscape nicht gefunden.")
@@ -262,6 +273,22 @@ def _ensure_black_fill_and_stroke(svg_content: str) -> str:
         style_dict["fill"] = "#000000"
         style_dict["stroke"] = "none"
         return 'style="' + ";".join(f"{k}:{v}" for k, v in style_dict.items()) + '"'
+ vn9i2t-codex/fix-svg-farbanzeige-probleme
+
+    svg_content = re.sub(r'style="([^"]*)"', _replace_style, svg_content)
+    svg_content = re.sub(r'fill="[^\"]*"', 'fill="#000000"', svg_content)
+    svg_content = re.sub(r'stroke="[^\"]*"', 'stroke="none"', svg_content)
+    return svg_content
+
+
+def preprocess_png(src: Path, dest: Path) -> None:
+    """Verbessert Kontrast und entfernt weiße Ränder vor dem Tracing."""
+    img = Image.open(src).convert("L")
+    img = ImageOps.autocontrast(img)
+    bbox = ImageOps.invert(img).getbbox()
+    if bbox:
+        img = img.crop(bbox)
+=======
 
     svg_content = re.sub(r'style="([^"]*)"', _replace_style, svg_content)
     svg_content = re.sub(r'fill="[^\"]*"', 'fill="#000000"', svg_content)
@@ -273,6 +300,7 @@ def preprocess_png(src: Path, dest: Path) -> None:
     """Verbessert den Kontrast eines PNG vor dem Tracing."""
     img = Image.open(src).convert("L")
     img = ImageOps.autocontrast(img)
+ main
     img.save(dest)
 
 
@@ -306,7 +334,16 @@ def trace_png_to_svg(png_path: Path, svg_out: Path):
             "--export-plain-svg",
         ]
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+vn9i2t-codex/fix-svg-farbanzeige-probleme
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+=======
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True) main
             if not svg_out.exists() or svg_out.stat().st_size == 0:
                 log.error(
                     "Inkscape hat keine SVG-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
@@ -387,7 +424,13 @@ def create_thumbnail(svg_path: Path, thumb_out: Path):
            "--export-background=white", # Stellt sicher, dass der Hintergrund weiß ist
            "--export-filename", str(thumb_out)] # Explizite Angabe von --export-filename für Robustheit
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         if not thumb_out.exists() or thumb_out.stat().st_size == 0:
             log.error("Inkscape hat keine Thumbnail-Datei erstellt oder sie ist leer: %s. stdout: %s, stderr: %s",
                       thumb_out, result.stdout, result.stderr)
